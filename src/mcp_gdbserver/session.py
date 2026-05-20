@@ -14,19 +14,22 @@ import asyncio
 import json
 import logging
 import os
-import pty
+import queue
 import re
-import select
 import signal
 import subprocess
+import threading
 from enum import Enum
 from typing import Any, Callable, Optional
+
+if os.name != "nt":
+    import pty
+    import select
 
 from .mi_parser import (
     MIOutput,
     MIRecordType,
     MIResult,
-    MIResultClass,
     MIStreamParser,
     parse_mi_line,
 )
@@ -120,6 +123,8 @@ class GDBSession:
         self._process: Optional[subprocess.Popen] = None
         self._master_fd: Optional[int] = None
         self._slave_fd: Optional[int] = None
+        self._output_queue: queue.SimpleQueue[str] = queue.SimpleQueue()
+        self._reader_thread: Optional[threading.Thread] = None
         self._token_counter = 0
         self._state = GDBState.IDLE
         self._stream_parser = MIStreamParser()
@@ -189,34 +194,10 @@ class GDBSession:
 
         logger.info("Starting GDB: %s --interpreter=mi3", self._gdb_path)
 
-        # Create PTY
-        self._master_fd, self._slave_fd = pty.openpty()
-
-        try:
-            self._process = subprocess.Popen(
-                [self._gdb_path, "--interpreter=mi3"],
-                stdin=self._slave_fd,
-                stdout=self._slave_fd,
-                stderr=self._slave_fd,
-                preexec_fn=os.setsid,
-                close_fds=False,
-            )
-        except FileNotFoundError:
-            os.close(self._master_fd)
-            os.close(self._slave_fd)
-            self._master_fd = None
-            self._slave_fd = None
-            raise GDBSessionError(f"GDB executable not found: {self._gdb_path}")
-        except OSError as e:
-            os.close(self._master_fd)
-            os.close(self._slave_fd)
-            self._master_fd = None
-            self._slave_fd = None
-            raise GDBSessionError(f"Failed to start GDB: {e}")
-
-        # Close slave in parent — only GDB process needs it
-        os.close(self._slave_fd)
-        self._slave_fd = None
+        if os.name == "nt":
+            self._start_windows_process()
+        else:
+            self._start_pty_process()
 
         self._running = True
         self._state = GDBState.STARTED
@@ -239,6 +220,79 @@ class GDBSession:
             await self.send_cli_command(cmd)
 
         logger.info("GDB started (PID=%d)", self._process.pid)
+
+    def _start_pty_process(self) -> None:
+        """Start GDB connected to a Unix PTY."""
+        self._master_fd, self._slave_fd = pty.openpty()
+
+        try:
+            self._process = subprocess.Popen(
+                [self._gdb_path, "--interpreter=mi3"],
+                stdin=self._slave_fd,
+                stdout=self._slave_fd,
+                stderr=self._slave_fd,
+                preexec_fn=os.setsid,
+                close_fds=False,
+            )
+        except FileNotFoundError:
+            self._close_pty_fds()
+            raise GDBSessionError(f"GDB executable not found: {self._gdb_path}")
+        except OSError as e:
+            self._close_pty_fds()
+            raise GDBSessionError(f"Failed to start GDB: {e}")
+
+        # Close slave in parent — only GDB process needs it
+        if self._slave_fd is not None:
+            os.close(self._slave_fd)
+            self._slave_fd = None
+
+    def _start_windows_process(self) -> None:
+        """Start GDB on Windows using pipes instead of Unix-only PTYs."""
+        try:
+            self._process = subprocess.Popen(
+                [self._gdb_path, "--interpreter=mi3"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+                bufsize=0,
+            )
+        except FileNotFoundError:
+            raise GDBSessionError(f"GDB executable not found: {self._gdb_path}")
+        except OSError as e:
+            raise GDBSessionError(f"Failed to start GDB: {e}")
+
+        self._reader_thread = threading.Thread(
+            target=self._read_windows_stdout,
+            name="gdb-stdout-reader",
+            daemon=True,
+        )
+        self._reader_thread.start()
+
+    def _read_windows_stdout(self) -> None:
+        """Read GDB stdout in a thread because Windows pipes are not select-able."""
+        if self._process is None or self._process.stdout is None:
+            return
+
+        while True:
+            try:
+                chunk = self._process.stdout.read(1)
+            except OSError:
+                break
+            if not chunk:
+                break
+            self._output_queue.put(chunk.decode("utf-8", errors="replace"))
+
+    def _close_pty_fds(self) -> None:
+        """Close PTY file descriptors if they are open."""
+        for fd_name in ("_master_fd", "_slave_fd"):
+            fd = getattr(self, fd_name)
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                setattr(self, fd_name, None)
 
     async def _wait_for_prompt(self) -> None:
         """Wait for the initial GDB prompt.
@@ -285,7 +339,16 @@ class GDBSession:
             await asyncio.sleep(0.01)
 
     def _read_available(self) -> str:
-        """Read available data from the PTY master fd (non-blocking)."""
+        """Read available data from GDB output without blocking."""
+        if os.name == "nt":
+            chunks: list[str] = []
+            while True:
+                try:
+                    chunks.append(self._output_queue.get_nowait())
+                except queue.Empty:
+                    break
+            return "".join(chunks)
+
         if self._master_fd is None:
             return ""
         try:
@@ -489,7 +552,17 @@ class GDBSession:
         return _strip_ansi(output.console_output)
 
     def _write(self, data: str) -> None:
-        """Write data to the PTY master fd."""
+        """Write data to GDB stdin."""
+        if os.name == "nt":
+            if self._process is None or self._process.stdin is None:
+                raise GDBSessionError("GDB stdin not available")
+            try:
+                self._process.stdin.write(data.encode("utf-8"))
+                self._process.stdin.flush()
+            except OSError as e:
+                raise GDBSessionError(f"Failed to write to GDB: {e}")
+            return
+
         if self._master_fd is None:
             raise GDBSessionError("PTY not available")
         try:
@@ -504,7 +577,10 @@ class GDBSession:
         cmd_logger.info("→ GDB: <SIGINT>")
         logger.info("Sending interrupt (Ctrl+C) to GDB (PID=%d)", self.pid)
         try:
-            os.kill(self._process.pid, signal.SIGINT)
+            if os.name == "nt":
+                os.kill(self._process.pid, signal.CTRL_BREAK_EVENT)
+            else:
+                os.kill(self._process.pid, signal.SIGINT)
         except ProcessLookupError:
             raise GDBSessionError("GDB process not found")
 
@@ -529,26 +605,27 @@ class GDBSession:
             self._reader_task.cancel()
 
         if self._process and self.is_alive:
-            try:
-                pgid = os.getpgid(self._process.pid)
-                os.killpg(pgid, signal.SIGTERM)
-            except (ProcessLookupError, OSError):
-                pass
+            if os.name == "nt":
+                self._process.terminate()
+            else:
+                try:
+                    pgid = os.getpgid(self._process.pid)
+                    os.killpg(pgid, signal.SIGTERM)
+                except (ProcessLookupError, OSError):
+                    pass
             try:
                 self._process.wait(timeout=3)
             except subprocess.TimeoutExpired:
-                try:
-                    pgid = os.getpgid(self._process.pid)
-                    os.killpg(pgid, signal.SIGKILL)
-                except (ProcessLookupError, OSError):
-                    pass
+                if os.name == "nt":
+                    self._process.kill()
+                else:
+                    try:
+                        pgid = os.getpgid(self._process.pid)
+                        os.killpg(pgid, signal.SIGKILL)
+                    except (ProcessLookupError, OSError):
+                        pass
 
-        if self._master_fd is not None:
-            try:
-                os.close(self._master_fd)
-            except OSError:
-                pass
-            self._master_fd = None
+        self._close_pty_fds()
 
         self._process = None
         self._state = GDBState.IDLE
