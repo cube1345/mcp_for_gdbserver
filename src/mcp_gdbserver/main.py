@@ -13,9 +13,7 @@ Usage:
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import signal
 import sys
 
 import anyio
@@ -87,7 +85,8 @@ async def _run(config) -> None:
         config: Validated MCPConfig instance
     """
     logger.info(
-        "Starting MCP SSE server on %s:%d (GDB: %s)",
+        "Starting MCP %s server on %s:%d (GDB: %s)",
+        config.transport,
         config.host,
         config.port,
         config.gdb_path,

@@ -31,7 +31,7 @@ class GdbServerManager:
     This manager is responsible for:
     - Starting the GDB server process (standard or custom)
     - Monitoring the process for unexpected exits
-    - Stopping the process gracefully (SIGTERM → SIGKILL)
+    - Stopping the process with graceful request, then forced kill
     - Reporting process status
     """
 
@@ -211,8 +211,8 @@ class GdbServerManager:
     def stop(self) -> None:
         """Stop the GDB server process gracefully.
 
-        Sends SIGTERM first, then SIGKILL after a timeout.
-        Uses os.killpg to terminate the entire process group.
+        On POSIX, sends SIGTERM to the process group first, then SIGKILL
+        after a timeout. On Windows, uses Popen.terminate(), then kill().
         """
         if self._process is None or not self.is_running:
             logger.debug("GDB server not running, nothing to stop")
@@ -221,29 +221,13 @@ class GdbServerManager:
         pid = self._process.pid
         logger.info("Stopping GDB server (PID=%d)", pid)
 
-        try:
-            # Kill the entire process group
-            pgid = os.getpgid(pid)
-            os.killpg(pgid, signal.SIGTERM)
-        except (ProcessLookupError, OSError):
-            # If setsid wasn't used, the process may not have its own group
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except (ProcessLookupError, OSError):
-                pass
+        self._terminate_process(pid)
 
         try:
             self._process.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            logger.warning("GDB server did not exit after SIGTERM, sending SIGKILL")
-            try:
-                pgid = os.getpgid(pid)
-                os.killpg(pgid, signal.SIGKILL)
-            except (ProcessLookupError, OSError):
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except (ProcessLookupError, OSError):
-                    pass
+            logger.warning("GDB server did not exit after termination request, forcing exit")
+            self._kill_process(pid)
             try:
                 self._process.wait(timeout=3)
             except subprocess.TimeoutExpired:
@@ -251,6 +235,46 @@ class GdbServerManager:
 
         self._running = False
         logger.info("GDB server stopped (PID=%d)", pid)
+
+    def _terminate_process(self, pid: int) -> None:
+        """Ask the managed process to exit."""
+        if os.name == "nt":
+            if self._process is None:
+                return
+            try:
+                self._process.terminate()
+            except OSError:
+                pass
+            return
+
+        try:
+            pgid = os.getpgid(pid)
+            os.killpg(pgid, signal.SIGTERM)
+        except (AttributeError, ProcessLookupError, OSError):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except (ProcessLookupError, OSError):
+                pass
+
+    def _kill_process(self, pid: int) -> None:
+        """Force the managed process to exit."""
+        if os.name == "nt":
+            if self._process is None:
+                return
+            try:
+                self._process.kill()
+            except OSError:
+                pass
+            return
+
+        try:
+            pgid = os.getpgid(pid)
+            os.killpg(pgid, signal.SIGKILL)
+        except (AttributeError, ProcessLookupError, OSError):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
 
     def get_status(self) -> dict:
         """Get the current status of the GDB server process."""

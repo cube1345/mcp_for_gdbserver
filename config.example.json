@@ -9,6 +9,11 @@
   ],
   "timeout_seconds": 30,
   "log_level": "INFO",
+  "workspace_roots": ["."],
+  "cmake_path": "cmake",
+  "pyocd_path": "pyocd",
+  "openocd_path": "openocd",
+  "git_path": "git",
 
   "gdbserver": {
     "mode": "standard",

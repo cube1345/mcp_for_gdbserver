@@ -68,12 +68,26 @@ class MCPConfig(BaseModel):
     # MCP SSE server settings
     host: str = Field(default="0.0.0.0", description="MCP SSE server bind host")
     port: int = Field(default=8765, description="MCP SSE server bind port")
+    transport: str = Field(
+        default="sse",
+        description="MCP transport: 'sse' or 'streamable_http'",
+    )
 
     # Default remote target
     default_target: Optional[str] = Field(
         default=None,
         description="Default remote target in host:port format",
     )
+
+    # Workspace and tool paths
+    workspace_roots: list[str] = Field(
+        default_factory=lambda: ["."],
+        description="Filesystem roots that workspace tools are allowed to read/write",
+    )
+    cmake_path: str = Field(default="cmake", description="Path to cmake executable")
+    pyocd_path: str = Field(default="pyocd", description="Path to pyOCD executable")
+    openocd_path: str = Field(default="openocd", description="Path to OpenOCD executable")
+    git_path: str = Field(default="git", description="Path to git executable")
 
     # GDB initialization commands
     gdb_init_commands: list[str] = Field(
@@ -107,6 +121,13 @@ class MCPConfig(BaseModel):
     def validate_port(cls, v: int) -> int:
         if not (1 <= v <= 65535):
             raise ValueError(f"port must be 1-65535, got {v}")
+        return v
+
+    @field_validator("transport")
+    @classmethod
+    def validate_transport(cls, v: str) -> str:
+        if v not in ("sse", "streamable_http"):
+            raise ValueError(f"transport must be 'sse' or 'streamable_http', got '{v}'")
         return v
 
 
@@ -152,6 +173,32 @@ def build_argparser() -> argparse.ArgumentParser:
         "--target", "-t",
         default=None,
         help="Default remote target (format: host:port)",
+    )
+    parser.add_argument(
+        "--workspace-root",
+        action="append",
+        default=None,
+        help="Allowed workspace root for filesystem/build/git tools (repeatable)",
+    )
+    parser.add_argument(
+        "--cmake-path",
+        default=None,
+        help="Path to cmake executable",
+    )
+    parser.add_argument(
+        "--pyocd-path",
+        default=None,
+        help="Path to pyOCD executable",
+    )
+    parser.add_argument(
+        "--openocd-path",
+        default=None,
+        help="Path to OpenOCD executable",
+    )
+    parser.add_argument(
+        "--git-path",
+        default=None,
+        help="Path to git executable",
     )
 
     # Standard GNU gdbserver options
@@ -251,13 +298,20 @@ def _load_env_config() -> dict[str, Any]:
       MCP_GDB_GDBSERVER__COMMAND="..."
     """
     config: dict[str, Any] = {}
-    prefix = "MCP_GDB_"
-
     env_map = {
         "MCP_GDB_GDB_PATH": ("gdb_path", str),
         "MCP_GDB_HOST": ("host", str),
         "MCP_GDB_PORT": ("port", int),
+        "MCP_GDB_TRANSPORT": ("transport", str),
         "MCP_GDB_TARGET": ("default_target", str),
+        "MCP_GDB_WORKSPACE_ROOTS": (
+            "workspace_roots",
+            lambda v: [item for item in v.split(os.pathsep) if item],
+        ),
+        "MCP_GDB_CMAKE_PATH": ("cmake_path", str),
+        "MCP_GDB_PYOCD_PATH": ("pyocd_path", str),
+        "MCP_GDB_OPENOCD_PATH": ("openocd_path", str),
+        "MCP_GDB_GIT_PATH": ("git_path", str),
         "MCP_GDB_TIMEOUT": ("timeout_seconds", float),
         "MCP_GDB_LOG_LEVEL": ("log_level", str),
     }
@@ -368,6 +422,16 @@ def load_config(args: list[str] | None = None) -> MCPConfig:
         cli_config["port"] = parsed.port
     if parsed.target is not None:
         cli_config["default_target"] = parsed.target
+    if parsed.workspace_root is not None:
+        cli_config["workspace_roots"] = parsed.workspace_root
+    if parsed.cmake_path is not None:
+        cli_config["cmake_path"] = parsed.cmake_path
+    if parsed.pyocd_path is not None:
+        cli_config["pyocd_path"] = parsed.pyocd_path
+    if parsed.openocd_path is not None:
+        cli_config["openocd_path"] = parsed.openocd_path
+    if parsed.git_path is not None:
+        cli_config["git_path"] = parsed.git_path
     if parsed.verbose:
         cli_config["log_level"] = "DEBUG"
 

@@ -7,13 +7,21 @@ registers all Tools and Resources, and provides the server run function.
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
 
+from .build_tools import register_build_tools
 from .config import MCPConfig
-from .tools import AppContext, set_context, register_tools
+from .docs_tools import register_docs_tools
+from .filesystem_tools import register_filesystem_tools
+from .git_tools import register_git_tools
+from .probe_tools import register_probe_tools
 from .resources import register_resources
+from .serial_tools import register_serial_tools
+from .svd_tools import register_svd_tools
+from .tools import AppContext, register_tools, set_context
+from .vscode_bridge import register_vscode_bridge_tools
+from .watch_tools import register_watch_tools
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +98,11 @@ def create_server(config: MCPConfig) -> FastMCP:
     ctx.gdb_path = config.gdb_path
     ctx.gdb_init_commands = list(config.gdb_init_commands)
     ctx.default_target = config.default_target
+    ctx.workspace_roots = list(config.workspace_roots)
+    ctx.cmake_path = config.cmake_path
+    ctx.pyocd_path = config.pyocd_path
+    ctx.openocd_path = config.openocd_path
+    ctx.git_path = config.git_path
     ctx.timeout_seconds = config.timeout_seconds
     set_context(ctx)
 
@@ -97,19 +110,40 @@ def create_server(config: MCPConfig) -> FastMCP:
     mcp = FastMCP(
         "MCP GDB Server",
         instructions=(
-            "MCP Server for GDB debugging via gdbserver. "
-            "Supports both standard GNU gdbserver and custom GDB servers "
-            "(ST-LINK, OpenOCD, JLink, etc.). "
-            "Use start_gdb_server to launch a GDB server, start_gdb to start GDB, "
-            "load_file to load an ELF, connect_target to connect, then use debugging tools."
+            "MCP Server for embedded and native GDB debugging via gdbserver-compatible "
+            "backends. Supports standard GNU gdbserver and custom GDB servers such as "
+            "pyOCD, ST-LINK GDB Server, OpenOCD, and J-Link GDB Server. "
+            "Recommended setup sequence: start_gdb_server, start_gdb, load_file with an "
+            "absolute ELF/AXF path, connect_target, break_insert, then continue_execution. "
+            "Use gdb://guide/debug-flow for the standard workflow and gdb://guide/tools "
+            "for tool categories, intent, and examples. Prefer structured tools for common "
+            "debug tasks; use run_command only when no dedicated tool exists. VS Code bridge "
+            "tools expose a command queue for extension-side UI actions. SVD tools decode "
+            "peripheral registers from CMSIS-SVD files. Workspace tools cover controlled "
+            "filesystem access, CMake builds, probe checks, serial logs, Git, and docs hints. "
+            "Watch tools maintain explicit AI-selected expressions for sidebars and debug UI."
         ),
     )
 
     # Register all tools and resources
     register_tools(mcp)
+    register_filesystem_tools(mcp)
+    register_build_tools(mcp)
+    register_probe_tools(mcp)
+    register_serial_tools(mcp)
+    register_git_tools(mcp)
+    register_docs_tools(mcp)
+    register_watch_tools(mcp)
+    register_vscode_bridge_tools(mcp)
+    register_svd_tools(mcp)
     register_resources(mcp)
 
-    logger.info("MCP server configured (host=%s, port=%d)", config.host, config.port)
+    logger.info(
+        "MCP server configured (host=%s, port=%d, transport=%s)",
+        config.host,
+        config.port,
+        config.transport,
+    )
     return mcp
 
 
@@ -124,10 +158,18 @@ async def run_server(config: MCPConfig) -> None:
     """
     mcp = create_server(config)
 
-    logger.info("Starting MCP SSE server on %s:%d", config.host, config.port)
+    logger.info(
+        "Starting MCP %s server on %s:%d",
+        config.transport,
+        config.host,
+        config.port,
+    )
 
     # Use the SSE transport via FastMCP's built-in run method
     mcp.settings.host = config.host
     mcp.settings.port = config.port
 
-    await mcp.run_sse_async()
+    if config.transport == "streamable_http":
+        await mcp.run_streamable_http_async()
+    else:
+        await mcp.run_sse_async()

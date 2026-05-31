@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
-import struct
+import re
 from typing import Annotated, Any, Optional
 
 from mcp.server.fastmcp import FastMCP
@@ -43,6 +43,11 @@ class AppContext:
         self.gdb_path: str = "arm-none-eabi-gdb"
         self.gdb_init_commands: list[str] = ["set pagination off", "set confirm off"]
         self.default_target: Optional[str] = None
+        self.workspace_roots: list[str] = ["."]
+        self.cmake_path: str = "cmake"
+        self.pyocd_path: str = "pyocd"
+        self.openocd_path: str = "openocd"
+        self.git_path: str = "git"
         self.timeout_seconds: float = 30.0
 
     @property
@@ -99,8 +104,6 @@ def set_context(ctx: AppContext) -> None:
 # ---------------------------------------------------------------------------
 # Helper functions
 # ---------------------------------------------------------------------------
-
-import re
 
 # Regex to match ANSI escape sequences.
 # MI3 mode outputs them as literal "\e[...m" strings (not raw ESC bytes),
@@ -631,7 +634,7 @@ def register_tools(mcp: FastMCP) -> None:
             output = await session.send_mi_command("-exec-run")
             if output.is_error:
                 # Try alternative: disconnect and reconnect
-                output2 = await session.send_cli_command("monitor reset")
+                await session.send_cli_command("monitor reset")
                 return str(_result_dict(True, "Restart attempted via monitor reset"))
             return str(_result_dict(True, "Program restarted"))
         except Exception as e:
@@ -1211,7 +1214,7 @@ def register_tools(mcp: FastMCP) -> None:
         session = ctx.ensure_session()
 
         try:
-            text = await session.send_raw_command(
+            await session.send_raw_command(
                 f"define hook-{event}\n{command}\nend"
             )
             return str(_result_dict(True, f"Hook defined for event '{event}'"))
